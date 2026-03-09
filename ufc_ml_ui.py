@@ -229,6 +229,12 @@ def show_training_summary(summary: Dict[str, object]) -> None:
         f"test={summary.get('test_rows', 'N/A')}"
     )
 
+    misclassified_count = summary.get("misclassified_count")
+    misclassified_rate = summary.get("misclassified_rate")
+    if misclassified_count is not None:
+        rate_text = _format_pct(misclassified_rate) if misclassified_rate is not None else "N/A"
+        st.write(f"Held-out mistakes: {misclassified_count} ({rate_text})")
+
     class_dist = summary.get("class_distribution")
     if class_dist:
         st.write("Class Distribution:", class_dist)
@@ -249,6 +255,16 @@ def show_training_summary(summary: Dict[str, object]) -> None:
     cv_scores = summary.get("cv_scores")
     if cv_scores:
         st.write(f"CV Scores ({summary.get('cv_folds', len(cv_scores))} folds):", cv_scores)
+
+    mistakes_path = summary.get("mistakes_path")
+    if mistakes_path and Path(mistakes_path).exists():
+        try:
+            mistakes_df = pd.read_csv(mistakes_path).head(10)
+        except Exception:
+            mistakes_df = None
+        if mistakes_df is not None and not mistakes_df.empty:
+            st.write(f"Held-Out Mistakes Preview ({mistakes_path})")
+            st.dataframe(mistakes_df, use_container_width=True)
 
 
 def prettify_profile_df(profile_df: pd.DataFrame) -> pd.DataFrame:

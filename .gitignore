@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 .cache/
+build/
+dist/
+*.spec
 
 *.pkl
 *.metadata.json
@@ -9,3 +12,7 @@ ui_prediction.json
 ufc_features.csv
 ufc_fight_data.csv
 ufc_profile_fights.csv
+ufc_test_predictions.csv
+ufc_test_mistakes.csv
+smoke_test_output.txt
+*.log

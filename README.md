@@ -7,6 +7,15 @@
 2. Launch the app:
    - `streamlit run ufc_ml_ui.py`
 
+## Desktop App
+
+- Launch the native desktop wrapper from source:
+  - `.venv\Scripts\python.exe ufc_desktop_app.py`
+- Build a Windows `.exe`:
+  - `powershell -ExecutionPolicy Bypass -File .\build_desktop.ps1`
+- The built executable will be created at:
+  - `dist\UFC ML Desktop.exe`
+
 ## What the UI Does
 
 - Lets you choose between:
@@ -19,6 +28,9 @@
   - cross-validation stats
   - confusion matrix
   - classification report
+  - held-out test prediction exports:
+    - `ufc_test_predictions.csv`
+    - `ufc_test_mistakes.csv`
 - Select two fighters from UFCStats and run prediction
 - Show model reasoning for the pick (top feature-based factors)
 - Enter sportsbook American odds to calculate:

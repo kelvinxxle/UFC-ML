@@ -135,6 +135,17 @@ class UFCFightPredictor:
         df = df.fillna(self.impute_values).fillna(0.0)
         return df
 
+    def _predict_ordered_frame(self, X: pd.DataFrame) -> tuple[int, float, float]:
+        pred = int(self.model.predict(X)[0])
+        if hasattr(self.model, "predict_proba"):
+            proba = self.model.predict_proba(X)[0]
+            red_prob = float(proba[0])
+            blue_prob = float(proba[1]) if len(proba) > 1 else float(1.0 - red_prob)
+        else:
+            red_prob = float(pred == 0)
+            blue_prob = float(pred == 1)
+        return pred, red_prob, blue_prob
+
     @staticmethod
     def _feature_to_label(feature: str) -> str:
         full_term_map = {
@@ -280,25 +291,31 @@ class UFCFightPredictor:
             return {"error": "Feature schema not available"}
 
         try:
-            X = self._build_aligned_frame(
+            X_forward = self._build_aligned_frame(
                 red_profile,
                 blue_profile,
                 red_fighter_name=red_fighter_name,
                 blue_fighter_name=blue_fighter_name,
             )
-            pred = int(self.model.predict(X)[0])
+            _, forward_red_prob, _ = self._predict_ordered_frame(X_forward)
 
-            if hasattr(self.model, "predict_proba"):
-                proba = self.model.predict_proba(X)[0]
-                red_prob = float(proba[0])
-                blue_prob = float(proba[1]) if len(proba) > 1 else float(1.0 - red_prob)
-            else:
-                red_prob = float(pred == 0)
-                blue_prob = float(pred == 1)
+            X_swapped = self._build_aligned_frame(
+                blue_profile,
+                red_profile,
+                red_fighter_name=blue_fighter_name,
+                blue_fighter_name=red_fighter_name,
+            )
+            _, swapped_red_prob, _ = self._predict_ordered_frame(X_swapped)
+
+            # Average both fighter orders so the final probability is invariant
+            # to which side was arbitrarily labeled red or blue at inference time.
+            red_prob = float(np.clip((forward_red_prob + (1.0 - swapped_red_prob)) / 2.0, 0.0, 1.0))
+            blue_prob = float(1.0 - red_prob)
+            pred = 0 if red_prob >= blue_prob else 1
 
             winner = red_fighter_name if pred == 0 else blue_fighter_name
             confidence = max(red_prob, blue_prob)
-            reasoning = self._build_reasoning(X, prediction_code=pred, top_n=5)
+            reasoning = self._build_reasoning(X_forward, prediction_code=pred, top_n=5)
             reasoning_summary = self._build_reasoning_summary(reasoning, pred_code=pred)
 
             return {
@@ -314,6 +331,7 @@ class UFCFightPredictor:
                 "blue_win_probability_value": blue_prob,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "input_schema": "ufc_profile_aligned_v2",
+                "probability_method": "corner_swap_averaged",
                 "reasoning_summary": reasoning_summary,
                 "reasoning": reasoning,
                 "explainability_note": "Feature-importance heuristic explanation (not causal proof).",

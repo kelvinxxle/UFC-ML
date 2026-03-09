@@ -25,6 +25,7 @@ from build_profile_aligned_dataset import UFCStatsProfileDatasetBuilder
 from process_ufc_data import (
     build_training_matrix,
     drop_redundant_features,
+    select_corner_invariant_features,
     train_model,
     validate_schema_or_raise,
 )
@@ -176,21 +177,40 @@ def scrape_fight_index(
     return df
 
 
-def train_aligned_model(input_csv: str, model_out: str, features_out: str) -> Dict[str, object]:
+def train_aligned_model(
+    input_csv: str,
+    model_out: str,
+    features_out: str,
+    test_predictions_out: str = "ufc_test_predictions.csv",
+    mistakes_out: str = "ufc_test_mistakes.csv",
+) -> Dict[str, object]:
     df = pd.read_csv(input_csv)
     print(f"[train] Input shape: {df.shape}")
 
     validate_schema_or_raise(df)
-    X_raw, y, drop_stats = build_training_matrix(df)
+    X_raw, y, row_meta, drop_stats = build_training_matrix(df)
     X_raw = drop_redundant_features(X_raw)
+    X_model = select_corner_invariant_features(X_raw)
+    X_model.attrs["row_meta"] = row_meta.reset_index(drop=True)
     print(
         "[train] Rows kept: {kept_rows}, dropped (label mismatch/draw): {dropped_for_label}, "
         "dropped (empty profile): {dropped_for_empty}".format(**drop_stats)
     )
 
-    model, train_meta = train_model(X_raw, y)
+    model, train_meta, test_predictions = train_model(X_model, y)
+    mistakes_df = (
+        test_predictions.loc[~test_predictions["was_correct"]]
+        .sort_values(by="prediction_confidence", ascending=False)
+        .reset_index(drop=True)
+    )
+    test_predictions.to_csv(test_predictions_out, index=False)
+    mistakes_df.to_csv(mistakes_out, index=False)
+    print(
+        "[train] Corner-invariant rows: {original_rows}, augmented train rows: {augmented_rows}, "
+        "held-out mistakes: {misclassified_count}".format(**train_meta)
+    )
 
-    final_X = X_raw.fillna(train_meta["impute_values"]).fillna(0.0)
+    final_X = X_model.fillna(train_meta["impute_values"]).fillna(0.0)
     if train_meta["zero_variance_columns"]:
         final_X = final_X.drop(columns=train_meta["zero_variance_columns"])
     final_X = final_X.reindex(columns=train_meta["feature_columns"], fill_value=0.0)
@@ -213,7 +233,7 @@ def train_aligned_model(input_csv: str, model_out: str, features_out: str) -> Di
         "fighter_context": drop_stats.get("fighter_context", {}),
         "stance_values": STANCE_VALUES,
         "profile_numeric_fields": PROFILE_NUMERIC_FIELDS,
-        "schema_version": 2,
+        "schema_version": 3,
         "source_dataset": input_csv,
         "training_summary": {
             "test_accuracy": train_meta["test_accuracy"],
@@ -227,12 +247,23 @@ def train_aligned_model(input_csv: str, model_out: str, features_out: str) -> Di
             "confusion_matrix_labels": train_meta.get("confusion_matrix_labels"),
             "confusion_matrix": train_meta.get("confusion_matrix"),
             "classification_report": train_meta.get("classification_report"),
+            "model_feature_strategy": "corner_invariant_comparison_only",
+            "original_rows": train_meta["original_rows"],
+            "augmented_rows": train_meta["augmented_rows"],
+            "misclassified_count": train_meta["misclassified_count"],
+            "misclassified_rate": train_meta["misclassified_rate"],
+            "test_predictions_path": test_predictions_out,
+            "mistakes_path": mistakes_out,
         },
         "metrics": {
             "test_accuracy": train_meta["test_accuracy"],
             "cv_mean_accuracy": train_meta["cv_mean_accuracy"],
             "train_rows": train_meta["train_rows"],
             "test_rows": train_meta["test_rows"],
+            "original_rows": train_meta["original_rows"],
+            "augmented_rows": train_meta["augmented_rows"],
+            "misclassified_count": train_meta["misclassified_count"],
+            "misclassified_rate": train_meta["misclassified_rate"],
         },
     }
 
@@ -243,6 +274,8 @@ def train_aligned_model(input_csv: str, model_out: str, features_out: str) -> Di
     print(f"[train] Saved model bundle: {model_out}")
     print(f"[train] Saved features: {features_out}")
     print(f"[train] Saved metrics: {metadata_path}")
+    print(f"[train] Saved held-out test predictions: {test_predictions_out}")
+    print(f"[train] Saved held-out mistakes: {mistakes_out}")
     return bundle
 
 
@@ -317,6 +350,8 @@ def main() -> None:
     parser.add_argument("--aligned-csv", default="ufc_profile_fights.csv")
     parser.add_argument("--model-out", default="ufc_rf_balanced_smote.pkl")
     parser.add_argument("--features-out", default="ufc_features.csv")
+    parser.add_argument("--test-predictions-out", default="ufc_test_predictions.csv")
+    parser.add_argument("--mistakes-out", default="ufc_test_mistakes.csv")
     parser.add_argument("--prediction-out", default="pipeline_prediction.json")
 
     parser.add_argument("--max-events", type=int, default=10)
@@ -382,6 +417,8 @@ def main() -> None:
             input_csv=args.aligned_csv,
             model_out=args.model_out,
             features_out=args.features_out,
+            test_predictions_out=args.test_predictions_out,
+            mistakes_out=args.mistakes_out,
         )
     else:
         if not Path(args.model_out).exists() or not Path(args.features_out).exists():

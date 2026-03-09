@@ -2,6 +2,8 @@ beautifulsoup4
 joblib
 numpy
 pandas
+pyinstaller
+pywebview
 requests
 scikit-learn
 streamlit
