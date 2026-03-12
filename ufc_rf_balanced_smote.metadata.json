@@ -1,0 +1,10 @@
+{
+  "test_accuracy": 0.9824561403508771,
+  "cv_mean_accuracy": 0.9888888888888889,
+  "train_rows": 450,
+  "test_rows": 57,
+  "original_rows": 282,
+  "augmented_rows": 450,
+  "misclassified_count": 1,
+  "misclassified_rate": 0.017543859649122806
+}

@@ -1,0 +1,2 @@
+red_fighter,blue_fighter,actual_label,actual_winner,event,date,fight_url,weight_class,method,round,red_profile_total_bouts,blue_profile_total_bouts,predicted_label,predicted_winner,red_win_probability,blue_win_probability,prediction_confidence,was_correct
+Diego Lopes,Jean Silva,0,Diego Lopes,UFC Fight Night: Lopes vs. Silva,,http://ufcstats.com/fight-details/de1a3734be60e6a1,Featherweight Bout,KO/TKO Round: 2 Time: 4:48 Time format: 5 Rnd (5-5-5-5-5) Referee: Mike Beltran,2.0,,,1,Jean Silva,0.02777777777777779,0.9722222222222222,0.9722222222222222,False
