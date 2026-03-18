@@ -216,18 +216,61 @@ def load_training_summary_from_bundle(model_path: str) -> Optional[Dict[str, obj
     return None
 
 
+def load_model_schema_version(model_path: str) -> Optional[int]:
+    path = Path(model_path)
+    if not path.exists():
+        return None
+    try:
+        bundle = joblib.load(path)
+    except Exception:
+        return None
+    if isinstance(bundle, dict):
+        version = bundle.get("schema_version")
+        if version is None:
+            return None
+        try:
+            return int(version)
+        except Exception:
+            return None
+    return None
+
+
 def show_training_summary(summary: Dict[str, object]) -> None:
     st.subheader("Training Results")
     left, mid, right = st.columns(3)
     left.metric("Test Accuracy", _safe_float(summary.get("test_accuracy")))
-    mid.metric("CV Mean Accuracy", _safe_float(summary.get("cv_mean_accuracy")))
-    right.metric("Feature Count", str(summary.get("feature_count", "N/A")))
+    if summary.get("validation_accuracy") is not None:
+        mid.metric("Validation Accuracy", _safe_float(summary.get("validation_accuracy")))
+    else:
+        mid.metric("CV Mean Accuracy", _safe_float(summary.get("cv_mean_accuracy")))
+    if summary.get("balanced_accuracy") is not None:
+        right.metric("Balanced Accuracy", _safe_float(summary.get("balanced_accuracy")))
+    else:
+        right.metric("Feature Count", str(summary.get("feature_count", "N/A")))
 
-    st.write(
-        "Rows: "
-        f"train={summary.get('train_rows', 'N/A')} | "
-        f"test={summary.get('test_rows', 'N/A')}"
-    )
+    if summary.get("validation_rows") is not None:
+        st.write(
+            "Rows: "
+            f"train={summary.get('train_rows', 'N/A')} | "
+            f"validation={summary.get('validation_rows', 'N/A')} | "
+            f"test={summary.get('test_rows', 'N/A')}"
+        )
+    else:
+        st.write(
+            "Rows: "
+            f"train={summary.get('train_rows', 'N/A')} | "
+            f"test={summary.get('test_rows', 'N/A')}"
+        )
+
+    if summary.get("split_strategy"):
+        st.write(f"Split Strategy: {summary.get('split_strategy')}")
+    if summary.get("train_date_range") and summary.get("validation_date_range") and summary.get("test_date_range"):
+        st.write(
+            "Date Windows: "
+            f"train={summary.get('train_date_range')} | "
+            f"validation={summary.get('validation_date_range')} | "
+            f"test={summary.get('test_date_range')}"
+        )
 
     misclassified_count = summary.get("misclassified_count")
     misclassified_rate = summary.get("misclassified_rate")
@@ -424,11 +467,26 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Pipeline Config")
+        pipeline_mode = st.selectbox("Backend mode", options=["legacy", "prefight_v1"], index=0)
         raw_fights_csv = st.text_input("Raw fights CSV", value="ufc_fight_data.csv")
         aligned_csv = st.text_input("Aligned profile CSV", value="ufc_profile_fights.csv")
         model_out = st.text_input("Model output", value="ufc_rf_balanced_smote.pkl")
         features_out = st.text_input("Features output", value="ufc_features.csv")
         prediction_out = st.text_input("Prediction JSON output", value="ui_prediction.json")
+        if pipeline_mode == "prefight_v1":
+            st.caption(
+                "Prefight mode uses reconstructed fight-history features. "
+                "Recommended outputs: ufc_prefight_fights.csv, ufc_prefight_model.pkl, ufc_prefight_features.csv."
+            )
+            if (
+                aligned_csv == "ufc_profile_fights.csv"
+                or model_out == "ufc_rf_balanced_smote.pkl"
+                or features_out == "ufc_features.csv"
+            ):
+                st.warning(
+                    "You selected prefight_v1 but are still pointing at legacy file names. "
+                    "Use prefight artifact names if you want to compare the new backend cleanly."
+                )
 
         max_events = st.slider("Number of events to scrape", min_value=1, max_value=80, value=20)
         max_fights = st.number_input(
@@ -450,6 +508,7 @@ def main() -> None:
         aligned_exists = Path(aligned_csv).exists()
         trained_exists = Path(model_out).exists() and Path(features_out).exists()
         saved_summary = load_training_summary_from_bundle(model_out) if trained_exists else None
+        saved_schema_version = load_model_schema_version(model_out) if trained_exists else None
         saved_set_is_outdated = False
         if isinstance(saved_summary, dict) and (
             "validation_accuracy" in saved_summary or saved_summary.get("split_strategy")
@@ -476,6 +535,11 @@ def main() -> None:
             st.warning(
                 "Saved dataset/model were built with the experimental branch. "
                 "Run a new training set once to rebuild them under the reverted pipeline."
+            )
+        if saved_schema_version in {2, 3}:
+            st.warning(
+                f"Loaded model bundle schema version is {saved_schema_version}. "
+                "That is a legacy/transition artifact, not the new trustworthy prefight model."
             )
 
         if training_mode == "Use current training set":
@@ -571,6 +635,8 @@ def main() -> None:
                         input_csv=raw_fights_csv,
                         output_csv=aligned_csv,
                         max_fights=None if int(max_fights) == 0 else int(max_fights),
+                        mode=pipeline_mode,
+                        manifest_out="ufc_prefight_manifest.json" if pipeline_mode == "prefight_v1" else None,
                     )
                     status.write(f"Aligned rows: {len(aligned_df)}")
                 else:
@@ -584,6 +650,7 @@ def main() -> None:
                         input_csv=aligned_csv,
                         model_out=model_out,
                         features_out=features_out,
+                        mode=pipeline_mode,
                     )
                     summary = bundle.get("training_summary") or bundle.get("metrics", {})
                     st.session_state["training_summary"] = summary
@@ -661,6 +728,8 @@ def main() -> None:
                 blue_fighter_name=blue_name,
                 red_ufc_profile=red_profile,
                 blue_ufc_profile=blue_profile,
+                red_profile_url=name_to_url[red_name],
+                blue_profile_url=name_to_url[blue_name],
             )
             if "error" in result:
                 raise RuntimeError(result["error"])

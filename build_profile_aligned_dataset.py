@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from prefight_dataset_builder import PrefightDatasetBuilder
 from ufc_profile_schema import PROFILE_NUMERIC_FIELDS, normalize_key, normalize_profile_input
 
 
@@ -210,7 +211,31 @@ class UFCStatsProfileDatasetBuilder:
         self.profile_cache[profile_url] = profile
         return profile
 
-    def build(self, input_csv: str, output_csv: str, max_fights: Optional[int] = None) -> pd.DataFrame:
+    def build(
+        self,
+        input_csv: str,
+        output_csv: str,
+        max_fights: Optional[int] = None,
+        mode: str = "legacy",
+        manifest_out: Optional[str] = None,
+        history_strategy: str = "exact",
+    ) -> pd.DataFrame:
+        if str(mode).strip().lower() == "prefight_v1":
+            prefight_builder = PrefightDatasetBuilder(
+                delay_seconds=self.delay_seconds,
+                timeout_seconds=self.timeout_seconds,
+                max_retries=self.max_retries,
+                cache_dir=str(self.cache_dir),
+            )
+            manifest_path = manifest_out or str(Path(output_csv).with_name("ufc_prefight_manifest.json"))
+            return prefight_builder.build_prefight(
+                input_csv=input_csv,
+                output_csv=output_csv,
+                manifest_out=manifest_path,
+                max_fights=max_fights,
+                history_strategy=history_strategy,
+            )
+
         src = pd.read_csv(input_csv)
         url_col = pick_column(src.columns, ["Fight_URL", "fight_url", "url"])
         red_col = pick_column(src.columns, ["Red", "red", "red_fighter"])
@@ -312,16 +337,28 @@ class UFCStatsProfileDatasetBuilder:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build UFC profile-aligned dataset")
+    parser = argparse.ArgumentParser(description="Build UFC datasets")
     parser.add_argument("--input", default="ufc_fight_data.csv", help="Input fight CSV with Fight_URL")
-    parser.add_argument("--output", default="ufc_profile_fights.csv", help="Output aligned CSV")
+    parser.add_argument("--output", default="ufc_prefight_fights.csv", help="Output CSV")
+    parser.add_argument(
+        "--manifest-out",
+        default="ufc_prefight_manifest.json",
+        help="Manifest JSON path for prefight_v1 mode",
+    )
     parser.add_argument("--max-fights", type=int, default=None, help="Limit number of fights")
+    parser.add_argument("--mode", choices=["legacy", "prefight_v1"], default="prefight_v1")
     parser.add_argument(
         "--delay", type=float, default=0.4, help="Delay between HTTP requests (seconds)"
     )
     parser.add_argument("--timeout", type=int, default=20, help="HTTP request timeout (seconds)")
     parser.add_argument("--retries", type=int, default=2, help="Request retries per URL")
     parser.add_argument("--cache-dir", default=".cache", help="Directory for response caches")
+    parser.add_argument(
+        "--history-strategy",
+        choices=["exact", "input_window_only"],
+        default="exact",
+        help="Prefight history collection strategy for prefight_v1 mode",
+    )
     args = parser.parse_args()
 
     builder = UFCStatsProfileDatasetBuilder(
@@ -330,7 +367,17 @@ def main():
         max_retries=args.retries,
         cache_dir=args.cache_dir,
     )
-    builder.build(input_csv=args.input, output_csv=args.output, max_fights=args.max_fights)
+    output_csv = args.output
+    if args.mode == "legacy" and output_csv == "ufc_prefight_fights.csv":
+        output_csv = "ufc_profile_fights.csv"
+    builder.build(
+        input_csv=args.input,
+        output_csv=output_csv,
+        max_fights=args.max_fights,
+        mode=args.mode,
+        manifest_out=args.manifest_out,
+        history_strategy=args.history_strategy,
+    )
 
 
 if __name__ == "__main__":

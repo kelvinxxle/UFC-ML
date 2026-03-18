@@ -12,6 +12,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from prefight_dataset_builder import PrefightDatasetBuilder
+from prefight_training import PREFIGHT_NUMERIC_FIELDS
 from ufc_profile_schema import STANCE_VALUES, build_feature_dict
 
 
@@ -28,6 +30,9 @@ class UFCFightPredictor:
         self.feature_stds = {}
         self.fighter_context = {}
         self.stance_values = STANCE_VALUES
+        self.schema_version = None
+        self.dataset_schema = None
+        self.prefight_builder: Optional[PrefightDatasetBuilder] = None
 
         try:
             loaded = joblib.load(model_path)
@@ -44,6 +49,8 @@ class UFCFightPredictor:
             self.feature_stds = dict(loaded.get("feature_stds", {}))
             self.fighter_context = dict(loaded.get("fighter_context", {}))
             self.stance_values = list(loaded.get("stance_values", STANCE_VALUES))
+            self.schema_version = loaded.get("schema_version")
+            self.dataset_schema = loaded.get("dataset_schema")
             if hasattr(self.model, "feature_names_in_"):
                 model_feature_names = [str(c) for c in self.model.feature_names_in_]
                 if model_feature_names:
@@ -90,6 +97,50 @@ class UFCFightPredictor:
             float(strength_map.get(fighter_name, default_strength)),
             float(std_map.get(fighter_name, default_std)),
         )
+
+    def _is_prefight_model(self) -> bool:
+        if self.dataset_schema == "prefight_v1":
+            return True
+        try:
+            if self.schema_version is not None and int(self.schema_version) >= 4:
+                return True
+        except Exception:
+            pass
+        return any(
+            column.startswith("delta_ufc_bouts_prior") or column.startswith("abs_delta_ufc_bouts_prior")
+            for column in self.feature_columns
+        )
+
+    def _get_prefight_builder(self) -> PrefightDatasetBuilder:
+        if self.prefight_builder is None:
+            self.prefight_builder = PrefightDatasetBuilder(
+                delay_seconds=0.15,
+                timeout_seconds=20,
+                max_retries=2,
+                cache_dir=".cache",
+            )
+        return self.prefight_builder
+
+    def _build_prefight_frame(
+        self,
+        red_snapshot: Dict[str, object],
+        blue_snapshot: Dict[str, object],
+    ) -> pd.DataFrame:
+        feature_dict: Dict[str, float] = {}
+        for field in PREFIGHT_NUMERIC_FIELDS:
+            red_val = pd.to_numeric(red_snapshot.get(field), errors="coerce")
+            blue_val = pd.to_numeric(blue_snapshot.get(field), errors="coerce")
+            delta = red_val - blue_val if pd.notna(red_val) and pd.notna(blue_val) else np.nan
+            feature_dict[f"delta_{field}"] = delta
+            feature_dict[f"abs_delta_{field}"] = abs(delta) if pd.notna(delta) else np.nan
+
+        red_stance = str(red_snapshot.get("stance", "")).strip().lower()
+        blue_stance = str(blue_snapshot.get("stance", "")).strip().lower()
+        feature_dict["stance_match"] = float(bool(red_stance and red_stance == blue_stance))
+
+        df = pd.DataFrame([feature_dict]).reindex(columns=self.feature_columns)
+        df = df.fillna(self.impute_values).fillna(0.0)
+        return df
 
     def _build_aligned_frame(
         self,
@@ -171,6 +222,28 @@ class UFCFightPredictor:
             "reach_in": "Reach (inches)",
             "weight_lbs": "Weight (pounds)",
             "age": "Age",
+            "age_at_fight": "Age",
+            "ufc_bouts_prior": "UFC Bouts Before Fight",
+            "ufc_wins_prior": "UFC Wins Before Fight",
+            "ufc_losses_prior": "UFC Losses Before Fight",
+            "ufc_draws_prior": "UFC Draws Before Fight",
+            "days_since_last_fight": "Days Since Last Fight",
+            "recent_form_last3": "Recent Form Over Last 3 Fights",
+            "recent_form_last5": "Recent Form Over Last 5 Fights",
+            "sig_landed_per_min_prior": "Significant Strikes Landed Per Minute",
+            "sig_absorbed_per_min_prior": "Significant Strikes Absorbed Per Minute",
+            "sig_acc_prior": "Significant Strike Accuracy",
+            "sig_def_prior": "Significant Strike Defense",
+            "td_landed_per15_prior": "Takedowns Landed Per 15 Minutes",
+            "td_acc_prior": "Takedown Accuracy",
+            "td_def_prior": "Takedown Defense",
+            "sub_att_per15_prior": "Submission Attempts Per 15 Minutes",
+            "finish_rate_prior": "Finish Rate",
+            "ko_tko_win_rate_prior": "KO/TKO Win Rate",
+            "submission_win_rate_prior": "Submission Win Rate",
+            "decision_win_rate_prior": "Decision Win Rate",
+            "elo_prior": "Elo Rating",
+            "opponent_avg_elo_prior": "Average Opponent Elo",
         }
 
         def metric_phrase(metric: str) -> str:
@@ -195,16 +268,19 @@ class UFCFightPredictor:
         return feature.replace("_", " ").title()
 
     def _build_reasoning(self, X: pd.DataFrame, prediction_code: int, top_n: int = 5) -> List[Dict]:
-        if not hasattr(self.model, "feature_importances_"):
-            return []
-
         row = X.iloc[0]
-        names = (
-            [str(c) for c in self.model.feature_names_in_]
-            if hasattr(self.model, "feature_names_in_")
-            else self.feature_columns
-        )
-        importances = self.model.feature_importances_
+        names = self.feature_columns
+        importances = None
+        if hasattr(self.model, "feature_importances_"):
+            importances = self.model.feature_importances_
+        elif hasattr(self.model, "named_steps"):
+            final_step = list(self.model.named_steps.values())[-1]
+            if hasattr(final_step, "coef_"):
+                importances = np.abs(np.ravel(final_step.coef_))
+        elif hasattr(self.model, "coef_"):
+            importances = np.abs(np.ravel(self.model.coef_))
+        if importances is None:
+            return []
         if len(names) != len(importances):
             return []
 
@@ -284,6 +360,8 @@ class UFCFightPredictor:
         blue_fighter_name: str,
         red_profile: Dict,
         blue_profile: Dict,
+        red_profile_url: Optional[str] = None,
+        blue_profile_url: Optional[str] = None,
     ) -> Dict:
         if self.model is None:
             return {"error": "Model not loaded"}
@@ -291,20 +369,43 @@ class UFCFightPredictor:
             return {"error": "Feature schema not available"}
 
         try:
-            X_forward = self._build_aligned_frame(
-                red_profile,
-                blue_profile,
-                red_fighter_name=red_fighter_name,
-                blue_fighter_name=blue_fighter_name,
-            )
-            _, forward_red_prob, _ = self._predict_ordered_frame(X_forward)
+            input_schema = "ufc_profile_aligned_v2"
+            if self._is_prefight_model():
+                if not red_profile_url or not blue_profile_url:
+                    return {
+                        "error": (
+                            "This model was trained on prefight_v1 features and requires fighter profile URLs "
+                            "to reconstruct live fight-history state."
+                        )
+                    }
+                prefight_builder = self._get_prefight_builder()
+                snapshots, snapshot_meta = prefight_builder.build_live_prefight_profiles(
+                    {
+                        red_fighter_name: red_profile_url,
+                        blue_fighter_name: blue_profile_url,
+                    }
+                )
+                red_snapshot = snapshots.get(red_fighter_name, {})
+                blue_snapshot = snapshots.get(blue_fighter_name, {})
+                X_forward = self._build_prefight_frame(red_snapshot, blue_snapshot)
+                X_swapped = self._build_prefight_frame(blue_snapshot, red_snapshot)
+                input_schema = "prefight_v1_live"
+            else:
+                snapshot_meta = {}
+                X_forward = self._build_aligned_frame(
+                    red_profile,
+                    blue_profile,
+                    red_fighter_name=red_fighter_name,
+                    blue_fighter_name=blue_fighter_name,
+                )
+                X_swapped = self._build_aligned_frame(
+                    blue_profile,
+                    red_profile,
+                    red_fighter_name=blue_fighter_name,
+                    blue_fighter_name=red_fighter_name,
+                )
 
-            X_swapped = self._build_aligned_frame(
-                blue_profile,
-                red_profile,
-                red_fighter_name=blue_fighter_name,
-                blue_fighter_name=red_fighter_name,
-            )
+            _, forward_red_prob, _ = self._predict_ordered_frame(X_forward)
             _, swapped_red_prob, _ = self._predict_ordered_frame(X_swapped)
 
             # Average both fighter orders so the final probability is invariant
@@ -330,10 +431,11 @@ class UFCFightPredictor:
                 "blue_win_probability": f"{blue_prob:.1%}",
                 "blue_win_probability_value": blue_prob,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "input_schema": "ufc_profile_aligned_v2",
+                "input_schema": input_schema,
                 "probability_method": "corner_swap_averaged",
                 "reasoning_summary": reasoning_summary,
                 "reasoning": reasoning,
+                "live_prefight_metadata": snapshot_meta if self._is_prefight_model() else None,
                 "explainability_note": "Feature-importance heuristic explanation (not causal proof).",
             }
         except Exception as exc:
@@ -345,6 +447,8 @@ class UFCFightPredictor:
         blue_fighter_name: str,
         red_ufc_profile: Dict,
         blue_ufc_profile: Dict,
+        red_profile_url: Optional[str] = None,
+        blue_profile_url: Optional[str] = None,
     ) -> Dict:
         """
         Convenience alias for UFC.com profile inputs.
@@ -354,6 +458,8 @@ class UFCFightPredictor:
             blue_fighter_name=blue_fighter_name,
             red_profile=red_ufc_profile,
             blue_profile=blue_ufc_profile,
+            red_profile_url=red_profile_url,
+            blue_profile_url=blue_profile_url,
         )
 
     @staticmethod

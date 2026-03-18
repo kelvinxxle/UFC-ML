@@ -11,8 +11,13 @@ dist/
 ui_prediction.json
 ufc_features.csv
 ufc_fight_data.csv
+ufc_prefight_*.csv
+ufc_prefight_*.json
+ufc_prefight_*.pkl
 ufc_profile_fights.csv
 ufc_test_predictions.csv
 ufc_test_mistakes.csv
 smoke_test_output.txt
 *.log
+tmp_model2*
+ufc_legacy_compare*

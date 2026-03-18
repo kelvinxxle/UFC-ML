@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -23,11 +24,7 @@ from bs4 import BeautifulSoup
 from betting_utils import analyze_market
 from build_profile_aligned_dataset import UFCStatsProfileDatasetBuilder
 from process_ufc_data import (
-    build_training_matrix,
-    drop_redundant_features,
-    select_corner_invariant_features,
-    train_model,
-    validate_schema_or_raise,
+    run_training_pipeline,
 )
 from ufc_fight_predictor import UFCFightPredictor
 from ufc_profile_schema import PROFILE_NUMERIC_FIELDS, STANCE_VALUES
@@ -139,6 +136,9 @@ def scrape_fight_index(
             continue
         event_tag = soup.select_one("span.b-content__title-highlight")
         event_name = event_tag.get_text(" ", strip=True) if event_tag else ""
+        event_text = " ".join(soup.stripped_strings)
+        event_date_match = re.search(r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4})", event_text)
+        event_date = event_date_match.group(1) if event_date_match else ""
 
         rows = soup.select("tr.b-fight-details__table-row[data-link]")
         for row in rows:
@@ -159,6 +159,8 @@ def scrape_fight_index(
                     "Winner": winner,
                     "Fight_URL": fight_url,
                     "Event": event_name,
+                    "Event_URL": event_url,
+                    "Event_Date": event_date,
                 }
             )
 
@@ -183,99 +185,16 @@ def train_aligned_model(
     features_out: str,
     test_predictions_out: str = "ufc_test_predictions.csv",
     mistakes_out: str = "ufc_test_mistakes.csv",
+    mode: str = "legacy",
 ) -> Dict[str, object]:
-    df = pd.read_csv(input_csv)
-    print(f"[train] Input shape: {df.shape}")
-
-    validate_schema_or_raise(df)
-    X_raw, y, row_meta, drop_stats = build_training_matrix(df)
-    X_raw = drop_redundant_features(X_raw)
-    X_model = select_corner_invariant_features(X_raw)
-    X_model.attrs["row_meta"] = row_meta.reset_index(drop=True)
-    print(
-        "[train] Rows kept: {kept_rows}, dropped (label mismatch/draw): {dropped_for_label}, "
-        "dropped (empty profile): {dropped_for_empty}".format(**drop_stats)
+    bundle = run_training_pipeline(
+        input_csv=input_csv,
+        model_out=model_out,
+        features_out=features_out,
+        test_predictions_out=test_predictions_out,
+        mistakes_out=mistakes_out,
+        mode=mode,
     )
-
-    model, train_meta, test_predictions = train_model(X_model, y)
-    mistakes_df = (
-        test_predictions.loc[~test_predictions["was_correct"]]
-        .sort_values(by="prediction_confidence", ascending=False)
-        .reset_index(drop=True)
-    )
-    test_predictions.to_csv(test_predictions_out, index=False)
-    mistakes_df.to_csv(mistakes_out, index=False)
-    print(
-        "[train] Corner-invariant rows: {original_rows}, augmented train rows: {augmented_rows}, "
-        "held-out mistakes: {misclassified_count}".format(**train_meta)
-    )
-
-    final_X = X_model.fillna(train_meta["impute_values"]).fillna(0.0)
-    if train_meta["zero_variance_columns"]:
-        final_X = final_X.drop(columns=train_meta["zero_variance_columns"])
-    final_X = final_X.reindex(columns=train_meta["feature_columns"], fill_value=0.0)
-
-    final_features = final_X.copy()
-    final_features["label"] = y.values
-    final_features.to_csv(features_out, index=False)
-
-    feature_means = final_X.mean(numeric_only=True).to_dict()
-    feature_stds = final_X.std(numeric_only=True).to_dict()
-    feature_means = {k: float(v) for k, v in feature_means.items() if pd.notna(v)}
-    feature_stds = {k: float(v) for k, v in feature_stds.items() if pd.notna(v)}
-
-    bundle = {
-        "model": model,
-        "feature_columns": train_meta["feature_columns"],
-        "impute_values": train_meta["impute_values"],
-        "feature_means": feature_means,
-        "feature_stds": feature_stds,
-        "fighter_context": drop_stats.get("fighter_context", {}),
-        "stance_values": STANCE_VALUES,
-        "profile_numeric_fields": PROFILE_NUMERIC_FIELDS,
-        "schema_version": 3,
-        "source_dataset": input_csv,
-        "training_summary": {
-            "test_accuracy": train_meta["test_accuracy"],
-            "cv_mean_accuracy": train_meta["cv_mean_accuracy"],
-            "cv_scores": train_meta.get("cv_scores"),
-            "cv_folds": train_meta.get("cv_folds"),
-            "train_rows": train_meta["train_rows"],
-            "test_rows": train_meta["test_rows"],
-            "feature_count": train_meta["feature_count"],
-            "class_distribution": train_meta.get("class_distribution"),
-            "confusion_matrix_labels": train_meta.get("confusion_matrix_labels"),
-            "confusion_matrix": train_meta.get("confusion_matrix"),
-            "classification_report": train_meta.get("classification_report"),
-            "model_feature_strategy": "corner_invariant_comparison_only",
-            "original_rows": train_meta["original_rows"],
-            "augmented_rows": train_meta["augmented_rows"],
-            "misclassified_count": train_meta["misclassified_count"],
-            "misclassified_rate": train_meta["misclassified_rate"],
-            "test_predictions_path": test_predictions_out,
-            "mistakes_path": mistakes_out,
-        },
-        "metrics": {
-            "test_accuracy": train_meta["test_accuracy"],
-            "cv_mean_accuracy": train_meta["cv_mean_accuracy"],
-            "train_rows": train_meta["train_rows"],
-            "test_rows": train_meta["test_rows"],
-            "original_rows": train_meta["original_rows"],
-            "augmented_rows": train_meta["augmented_rows"],
-            "misclassified_count": train_meta["misclassified_count"],
-            "misclassified_rate": train_meta["misclassified_rate"],
-        },
-    }
-
-    joblib.dump(bundle, model_out)
-    metadata_path = Path(model_out).with_suffix(".metadata.json")
-    metadata_path.write_text(json.dumps(bundle["metrics"], indent=2), encoding="utf-8")
-
-    print(f"[train] Saved model bundle: {model_out}")
-    print(f"[train] Saved features: {features_out}")
-    print(f"[train] Saved metrics: {metadata_path}")
-    print(f"[train] Saved held-out test predictions: {test_predictions_out}")
-    print(f"[train] Saved held-out mistakes: {mistakes_out}")
     return bundle
 
 
@@ -346,12 +265,14 @@ def run_prediction(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run UFC ML end-to-end pipeline")
+    parser.add_argument("--mode", choices=["legacy", "prefight_v1"], default="prefight_v1")
     parser.add_argument("--raw-fights-csv", default="ufc_fight_data.csv")
-    parser.add_argument("--aligned-csv", default="ufc_profile_fights.csv")
-    parser.add_argument("--model-out", default="ufc_rf_balanced_smote.pkl")
-    parser.add_argument("--features-out", default="ufc_features.csv")
-    parser.add_argument("--test-predictions-out", default="ufc_test_predictions.csv")
-    parser.add_argument("--mistakes-out", default="ufc_test_mistakes.csv")
+    parser.add_argument("--aligned-csv", default="ufc_prefight_fights.csv")
+    parser.add_argument("--manifest-out", default="ufc_prefight_manifest.json")
+    parser.add_argument("--model-out", default="ufc_prefight_model.pkl")
+    parser.add_argument("--features-out", default="ufc_prefight_features.csv")
+    parser.add_argument("--test-predictions-out", default="ufc_prefight_test_predictions.csv")
+    parser.add_argument("--mistakes-out", default="ufc_prefight_test_mistakes.csv")
     parser.add_argument("--prediction-out", default="pipeline_prediction.json")
 
     parser.add_argument("--max-events", type=int, default=10)
@@ -378,6 +299,17 @@ def main() -> None:
     parser.add_argument("--fractional-kelly", type=float, default=0.25)
 
     args = parser.parse_args()
+    if args.mode == "legacy":
+        if args.aligned_csv == "ufc_prefight_fights.csv":
+            args.aligned_csv = "ufc_profile_fights.csv"
+        if args.model_out == "ufc_prefight_model.pkl":
+            args.model_out = "ufc_rf_balanced_smote.pkl"
+        if args.features_out == "ufc_prefight_features.csv":
+            args.features_out = "ufc_features.csv"
+        if args.test_predictions_out == "ufc_prefight_test_predictions.csv":
+            args.test_predictions_out = "ufc_test_predictions.csv"
+        if args.mistakes_out == "ufc_prefight_test_mistakes.csv":
+            args.mistakes_out = "ufc_test_mistakes.csv"
 
     if not args.skip_scrape:
         scrape_fight_index(
@@ -404,6 +336,8 @@ def main() -> None:
             input_csv=args.raw_fights_csv,
             output_csv=args.aligned_csv,
             max_fights=args.max_fights,
+            mode=args.mode,
+            manifest_out=args.manifest_out,
         )
     else:
         if not Path(args.aligned_csv).exists():
@@ -419,6 +353,7 @@ def main() -> None:
             features_out=args.features_out,
             test_predictions_out=args.test_predictions_out,
             mistakes_out=args.mistakes_out,
+            mode=args.mode,
         )
     else:
         if not Path(args.model_out).exists() or not Path(args.features_out).exists():
@@ -427,7 +362,12 @@ def main() -> None:
             )
         print(f"[train] Skipped. Using existing model: {args.model_out}")
 
-    if not args.skip_predict:
+    if not args.skip_predict and args.mode == "prefight_v1":
+        print(
+            "[predict] Skipped. prefight_v1 is training-only in Milestone 1; "
+            "use --mode legacy for live prediction."
+        )
+    elif not args.skip_predict:
         run_prediction(
             model_path=args.model_out,
             features_path=args.features_out,

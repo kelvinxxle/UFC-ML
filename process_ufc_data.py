@@ -21,6 +21,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import cross_val_score, train_test_split
 
+from prefight_training import (
+    detect_prefight_schema,
+    run_prefight_training,
+    validate_prefight_schema,
+)
+
 from ufc_profile_schema import (
     PROFILE_NUMERIC_FIELDS,
     STANCE_VALUES,
@@ -30,6 +36,7 @@ from ufc_profile_schema import (
 
 
 DEFAULT_INPUT_CANDIDATES = [
+    "ufc_prefight_fights.csv",
     "ufc_profile_fights.csv",
     "expanded_real_ufc_data.csv",
     "expanded_ufc_fight_data.csv",
@@ -55,14 +62,21 @@ def find_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optio
     return None
 
 
-def choose_input_file(explicit_path: Optional[str]) -> Path:
+def choose_input_file(explicit_path: Optional[str], mode: str = "auto") -> Path:
     if explicit_path:
         path = Path(explicit_path)
         if not path.exists():
             raise FileNotFoundError(f"Input file not found: {path}")
         return path
 
-    for candidate in DEFAULT_INPUT_CANDIDATES:
+    requested_mode = str(mode).strip().lower()
+    candidates = list(DEFAULT_INPUT_CANDIDATES)
+    if requested_mode == "legacy":
+        candidates = [c for c in candidates if c != "ufc_prefight_fights.csv"]
+    elif requested_mode == "prefight_v1":
+        candidates = ["ufc_prefight_fights.csv"] + [c for c in candidates if c != "ufc_prefight_fights.csv"]
+
+    for candidate in candidates:
         path = Path(candidate)
         if path.exists():
             return path
@@ -89,6 +103,10 @@ def extract_corner_payload(row: pd.Series, corner: str) -> Dict[str, object]:
 
 
 def validate_schema_or_raise(df: pd.DataFrame) -> None:
+    if detect_prefight_schema(df):
+        validate_prefight_schema(df)
+        return
+
     normalized_cols = {normalize_key(c) for c in df.columns}
     has_red_profile = any(col.startswith("red_") for col in normalized_cols)
     has_blue_profile = any(col.startswith("blue_") for col in normalized_cols)
@@ -506,31 +524,40 @@ def train_model(
     return model, metadata, test_predictions
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train UFC profile-aligned model")
-    parser.add_argument("--input", default=None, help="Input CSV path")
-    parser.add_argument(
-        "--model-out", default="ufc_rf_balanced_smote.pkl", help="Output model path"
-    )
-    parser.add_argument("--features-out", default="ufc_features.csv", help="Output feature CSV")
-    parser.add_argument(
-        "--test-predictions-out",
-        default="ufc_test_predictions.csv",
-        help="Output CSV for held-out test predictions",
-    )
-    parser.add_argument(
-        "--mistakes-out",
-        default="ufc_test_mistakes.csv",
-        help="Output CSV for held-out test mispredictions only",
-    )
-    args = parser.parse_args()
-
-    input_path = choose_input_file(args.input)
-    print(f"Loading dataset: {input_path}")
+def run_training_pipeline(
+    input_csv: str,
+    model_out: str,
+    features_out: str,
+    test_predictions_out: str,
+    mistakes_out: str,
+    mode: str = "auto",
+) -> Dict[str, object]:
+    input_path = choose_input_file(input_csv, mode=mode)
     df = pd.read_csv(input_path)
-    print(f"Raw shape: {df.shape}")
+    requested_mode = str(mode).strip().lower()
+    detected_mode = "prefight_v1" if detect_prefight_schema(df) else "legacy"
+    if requested_mode in {"legacy", "prefight_v1"}:
+        active_mode = requested_mode
+    else:
+        active_mode = detected_mode
+
+    if active_mode == "prefight_v1":
+        if not detect_prefight_schema(df):
+            raise ValueError(
+                "Requested prefight_v1 training, but the dataset is not a prefight_v1 build."
+            )
+        return run_prefight_training(
+            input_csv=str(input_path),
+            model_out=model_out,
+            features_out=features_out,
+            test_predictions_out=test_predictions_out,
+            mistakes_out=mistakes_out,
+            df=df,
+        )
 
     validate_schema_or_raise(df)
+    print(f"Raw shape: {df.shape}")
+
     X_raw, y, row_meta, drop_stats = build_training_matrix(df)
     X_raw = drop_redundant_features(X_raw)
     X_model = select_corner_invariant_features(X_raw)
@@ -546,21 +573,20 @@ def main() -> None:
         .sort_values(by="prediction_confidence", ascending=False)
         .reset_index(drop=True)
     )
-    test_predictions.to_csv(args.test_predictions_out, index=False)
-    mistakes_df.to_csv(args.mistakes_out, index=False)
+    test_predictions.to_csv(test_predictions_out, index=False)
+    mistakes_df.to_csv(mistakes_out, index=False)
     print(
         "Corner-invariant rows: {original_rows}, augmented train rows: {augmented_rows}, "
         "held-out mistakes: {misclassified_count}".format(**train_meta)
     )
 
-    # Rebuild the final imputed feature frame for reproducible predictor input contract.
     final_X = X_model.fillna(train_meta["impute_values"]).fillna(0.0)
     if train_meta["zero_variance_columns"]:
         final_X = final_X.drop(columns=train_meta["zero_variance_columns"])
     final_X = final_X.reindex(columns=train_meta["feature_columns"], fill_value=0.0)
     final_features = final_X.copy()
     final_features["label"] = y.values
-    final_features.to_csv(args.features_out, index=False)
+    final_features.to_csv(features_out, index=False)
 
     feature_means = final_X.mean(numeric_only=True).to_dict()
     feature_stds = final_X.std(numeric_only=True).to_dict()
@@ -595,8 +621,8 @@ def main() -> None:
             "augmented_rows": train_meta["augmented_rows"],
             "misclassified_count": train_meta["misclassified_count"],
             "misclassified_rate": train_meta["misclassified_rate"],
-            "test_predictions_path": args.test_predictions_out,
-            "mistakes_path": args.mistakes_out,
+            "test_predictions_path": test_predictions_out,
+            "mistakes_path": mistakes_out,
         },
         "metrics": {
             "test_accuracy": train_meta["test_accuracy"],
@@ -609,19 +635,66 @@ def main() -> None:
             "misclassified_rate": train_meta["misclassified_rate"],
         },
     }
-    joblib.dump(bundle, args.model_out)
+    joblib.dump(bundle, model_out)
 
-    metadata_path = Path(args.model_out).with_suffix(".metadata.json")
+    metadata_path = Path(model_out).with_suffix(".metadata.json")
     metadata_path.write_text(json.dumps(bundle["metrics"], indent=2), encoding="utf-8")
 
-    print(f"Saved model bundle: {args.model_out}")
-    print(f"Saved features: {args.features_out}")
+    print(f"Saved model bundle: {model_out}")
+    print(f"Saved features: {features_out}")
     print(f"Saved training metrics: {metadata_path}")
-    print(f"Saved held-out test predictions: {args.test_predictions_out}")
-    print(f"Saved held-out mistakes: {args.mistakes_out}")
+    print(f"Saved held-out test predictions: {test_predictions_out}")
+    print(f"Saved held-out mistakes: {mistakes_out}")
     print(
         "Schema aligned for UFC.com-style input. Prediction now expects profile fields "
         "instead of fighter-pair-specific columns."
+    )
+    return bundle
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train UFC profile-aligned model")
+    parser.add_argument("--input", default=None, help="Input CSV path")
+    parser.add_argument("--mode", choices=["auto", "legacy", "prefight_v1"], default="auto")
+    parser.add_argument(
+        "--model-out", default="ufc_rf_balanced_smote.pkl", help="Output model path"
+    )
+    parser.add_argument("--features-out", default="ufc_features.csv", help="Output feature CSV")
+    parser.add_argument(
+        "--test-predictions-out",
+        default="ufc_test_predictions.csv",
+        help="Output CSV for held-out test predictions",
+    )
+    parser.add_argument(
+        "--mistakes-out",
+        default="ufc_test_mistakes.csv",
+        help="Output CSV for held-out test mispredictions only",
+    )
+    args = parser.parse_args()
+
+    model_out = args.model_out
+    features_out = args.features_out
+    test_predictions_out = args.test_predictions_out
+    mistakes_out = args.mistakes_out
+    if args.mode == "prefight_v1":
+        if model_out == "ufc_rf_balanced_smote.pkl":
+            model_out = "ufc_prefight_model.pkl"
+        if features_out == "ufc_features.csv":
+            features_out = "ufc_prefight_features.csv"
+        if test_predictions_out == "ufc_test_predictions.csv":
+            test_predictions_out = "ufc_prefight_test_predictions.csv"
+        if mistakes_out == "ufc_test_mistakes.csv":
+            mistakes_out = "ufc_prefight_test_mistakes.csv"
+
+    input_path = choose_input_file(args.input, mode=args.mode)
+    print(f"Loading dataset: {input_path}")
+    run_training_pipeline(
+        input_csv=str(input_path),
+        model_out=model_out,
+        features_out=features_out,
+        test_predictions_out=test_predictions_out,
+        mistakes_out=mistakes_out,
+        mode=args.mode,
     )
 
 
